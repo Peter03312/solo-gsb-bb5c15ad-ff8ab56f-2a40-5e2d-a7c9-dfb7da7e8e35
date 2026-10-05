@@ -132,7 +132,10 @@ Node.js（Express）+ PostgreSQL，本地账号区分两类角色：
       （展品详情仅附加 `incidents` / `incidentDoseYearly`，占用来源仅附加 `kind:'incident'`）。
 18. **实测 CSV 批次导入（conservator only）**：保管员可将某条**已批准（或待复核）计划**的分段实测
     CSV 导入为**待确认批次**；每行含墙上起止日期时间与实际照度（3~4 列：
-    `开始日期时间,结束日期时间,实际照度[,备注]`，首行表头自动识别）。
+    `开始日期时间,结束日期时间,实际照度[,备注]`）。首行**仅在整行都能识别为列名**
+    （如 `开始时间,结束时间,实际照度[,备注]` 或 `start,end,lux[,note]`，大小写/下划线/连字符
+    不敏感）时自动跳过，可用 `hasHeader=true/false` 显式指定；**疑似数据但格式错误的首行**
+    （如 `bad-start,bad-end,bad-lux`）不跳过，按数据行逐行校验并按**原文件行号**报出全部原因。
     - **预览/导入同一校验口径**：逐行按自然年拆分剂量并汇总整批剂量，返回**整批预计占用**
       （实测替代估算口径：预计合计 = 当前占用 − 被替代估算 + 本批剂量）；**预览不写库、
       导入仅保存待确认批次，均不改变额度**。
@@ -1227,8 +1230,14 @@ curl -b cookies-custodian.txt -X POST http://localhost:3000/api/measurements/31/
 
 保管员把某条**已批准（或待复核）计划**的分段实测 CSV 导入为**待确认批次**，预览/确认后再入账。
 CSV 每行 3~4 列：`开始日期时间,结束日期时间,实际照度[,备注]`；日期时间为墙上时间
-`YYYY-MM-DD HH:MM`（分隔符可为空格或 `T`，秒仅允许 `:00`）；首行为表头时自动跳过
-（可用 `hasHeader=true/false` 显式指定）；单批最多 5000 行。
+`YYYY-MM-DD HH:MM`（分隔符可为空格或 `T`，秒仅允许 `:00`）；单批最多 5000 行。
+**表头判断**：未指定 `hasHeader` 时，首行**仅在整行 3~4 列都能识别为已知列名**时才自动跳过
+（中列名如 `开始时间/开始日期时间/开始`、`结束时间/结束日期时间/结束`、`实际照度/实测照度/照度`、
+`备注/说明`，英列名如 `start/begin/from`、`end/finish/to`、`lux/actual_lux/illuminance`、
+`note/remark/comment`，大小写与 `_`/`-`/空格不敏感）；否则首行一律按数据行参与逐行校验——
+**疑似数据但格式错误的首行（如 `bad-start,bad-end,bad-lux`）不会被误当作表头跳过**，
+而是按**原文件行号**报出全部取值原因，预览/导入**整批拒绝**（不保存批次、不改变额度）。
+`hasHeader=true/false` 显式指定时严格按调用者处理（`true` 无条件跳过首行，`false` 不跳过）。
 提交方式二选一：JSON `{"planId":7,"csv":"...","sourceName":"march.csv"}`，
 或 `Content-Type: text/csv` 直接提交 CSV 原文（`planId` 走查询参数）。
 
@@ -1272,6 +1281,12 @@ curl -b cookies.txt http://localhost:3000/api/measurement-batches/1
 
 # 4) 确认：锁内重核后原子生成已确认实测（重复调用返回原批次结果）
 curl -b cookies-custodian.txt -X POST http://localhost:3000/api/measurement-batches/1/confirm
+
+# 5) 表头判断：无表头文件可显式 hasHeader=false；首行是错误数据时不会被误当表头跳过，
+#    按原文件行号报出全部原因并整批拒绝（400，details.rows 见下文错误响应示例）
+curl -b cookies-custodian.txt -X POST http://localhost:3000/api/measurement-batches/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"planId":7,"csv":"bad-start,bad-end,bad-lux\n2031-03-01 09:00,2031-03-01 12:00,120\n","hasHeader":false}'
 ```
 
 预览响应（`preview`）：逐行 `rows[].yearly`（按自然年剂量）、整批 `totalYearly`，以及
@@ -1311,6 +1326,25 @@ curl -b cookies-custodian.txt -X POST http://localhost:3000/api/measurement-batc
       { "row": 6, "line": 6, "kinds": ["overlap"],
         "reasons": ["与第 5 行（2031-03-01 10:00 ~ 2031-03-01 11:00）时段相交"],
         "conflicts": { "overlappingRows": [5] } }
+    ]
+  }
+}
+```
+
+首行是**疑似数据但格式错误**（如 `bad-start,bad-end,bad-lux`）时不会被误当表头跳过，
+而是作为第 1 个数据行按**原文件行号**报出全部取值原因，预览/导入同样整批拒绝（400），
+不保存批次、不改变额度：
+
+```json
+{
+  "error": "实测 CSV 校验失败，整批未保存：第 1 行：开始日期时间无效：bad-start（应为 YYYY-MM-DD HH:MM）；结束日期时间无效：bad-end（应为 YYYY-MM-DD HH:MM）；实际照度必须是数字：bad-lux",
+  "details": {
+    "rows": [
+      { "row": 1, "line": 1, "kinds": ["value"],
+        "reasons": ["开始日期时间无效：bad-start（应为 YYYY-MM-DD HH:MM）",
+                    "结束日期时间无效：bad-end（应为 YYYY-MM-DD HH:MM）",
+                    "实际照度必须是数字：bad-lux"],
+        "conflicts": {} }
     ]
   }
 }

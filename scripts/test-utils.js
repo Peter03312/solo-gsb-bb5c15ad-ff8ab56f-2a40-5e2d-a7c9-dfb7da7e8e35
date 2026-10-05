@@ -151,4 +151,82 @@ test('事故完全在开灯窗外：窗内为 0，计划残余不被扣减，事
   assert.strictEqual(dosing.doseByYear([incident], 50).get(2026), 100);
 });
 
+// 8) 实测 CSV 表头自动识别（规则 18：仅整行可识别为列名才跳过）
+{
+  const { parseMeasurementCsvRows, isHeaderRow } = require('../src/csv');
+
+  test('中文表头整行命中列名时自动跳过', () => {
+    const { rows, headerDetected } = parseMeasurementCsvRows(
+      '开始时间,结束时间,实际照度,备注\n2026-03-01 09:00,2026-03-01 10:00,100,上午\n'
+    );
+    assert.strictEqual(headerDetected, true);
+    assert.strictEqual(rows.length, 1);
+    assert.strictEqual(rows[0].line, 2);
+    assert.strictEqual(rows[0].errors.length, 0);
+  });
+
+  test('英文列名（大小写/下划线/连字符规范化）也识别为表头', () => {
+    assert.strictEqual(isHeaderRow(['start', 'end', 'lux']), true);
+    assert.strictEqual(isHeaderRow(['Start_Time', 'end-time', 'Actual Lux', 'Note']), true);
+    const { headerDetected, rows } = parseMeasurementCsvRows(
+      'start,end,lux\n2026-03-01 09:00,2026-03-01 10:00,100\n'
+    );
+    assert.strictEqual(headerDetected, true);
+    assert.strictEqual(rows.length, 1);
+  });
+
+  test('疑似数据但格式错误的首行（bad-start,bad-end,bad-lux）不当作表头', () => {
+    assert.strictEqual(isHeaderRow(['bad-start', 'bad-end', 'bad-lux']), false);
+    const { rows, headerDetected } = parseMeasurementCsvRows(
+      'bad-start,bad-end,bad-lux\n2026-03-01 09:00,2026-03-01 10:00,100\n'
+    );
+    assert.strictEqual(headerDetected, false);
+    assert.strictEqual(rows.length, 2);
+    // 首行按原文件行号 1 报出全部取值原因（开始/结束/照度各一条）
+    assert.strictEqual(rows[0].row, 1);
+    assert.strictEqual(rows[0].line, 1);
+    assert.strictEqual(rows[0].errors.length, 3);
+    assert.ok(rows[0].errors.some((e) => /开始日期时间无效：bad-start/.test(e)));
+    assert.ok(rows[0].errors.some((e) => /结束日期时间无效：bad-end/.test(e)));
+    assert.ok(rows[0].errors.some((e) => /实际照度必须是数字：bad-lux/.test(e)));
+    // 第二行正常解析
+    assert.strictEqual(rows[1].line, 2);
+    assert.strictEqual(rows[1].errors.length, 0);
+  });
+
+  test('无表头文件首行即数据，不错误跳过', () => {
+    const { rows, headerDetected } = parseMeasurementCsvRows(
+      '2026-03-01 09:00,2026-03-01 10:00,100\n2026-03-01 10:00,2026-03-01 11:00,100\n'
+    );
+    assert.strictEqual(headerDetected, false);
+    assert.strictEqual(rows.length, 2);
+    assert.ok(rows.every((r) => r.errors.length === 0));
+  });
+
+  test('显式 hasHeader=true/false 按调用者指定处理', () => {
+    // hasHeader=true：首行即使是数据也跳过
+    const skipped = parseMeasurementCsvRows(
+      '2026-03-01 09:00,2026-03-01 10:00,100\n2026-03-01 10:00,2026-03-01 11:00,100\n',
+      { hasHeader: true }
+    );
+    assert.strictEqual(skipped.headerDetected, true);
+    assert.strictEqual(skipped.rows.length, 1);
+    // hasHeader=false：首行即使是列名也按数据行校验（报取值错误）
+    const forced = parseMeasurementCsvRows(
+      '开始时间,结束时间,实际照度\n2026-03-01 09:00,2026-03-01 10:00,100\n',
+      { hasHeader: false }
+    );
+    assert.strictEqual(forced.headerDetected, false);
+    assert.strictEqual(forced.rows.length, 2);
+    assert.strictEqual(forced.rows[0].line, 1);
+    assert.ok(forced.rows[0].errors.length > 0);
+  });
+
+  test('列名不全/超列的首行不识别为表头', () => {
+    assert.strictEqual(isHeaderRow(['开始时间', '结束时间']), false); // 列数不足
+    assert.strictEqual(isHeaderRow(['开始时间', '结束时间', '实际照度', '备注', '额外']), false);
+    assert.strictEqual(isHeaderRow(['开始时间', 'bad-end', '实际照度']), false); // 部分命中不算
+  });
+}
+
 console.log(`\n全部 ${passed} 项算法测试通过。`);

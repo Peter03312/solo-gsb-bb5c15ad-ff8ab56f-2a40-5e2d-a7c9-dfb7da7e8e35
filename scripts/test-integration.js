@@ -2756,6 +2756,67 @@ async function runFlow() {
     '2031-03-01 10:00,2031-03-01 11:00,100\n', 'text/csv', 'c');
   assert(r.status === 200 && r.body.preview.rowCount === 1, 'text/csv 原文预览（planId 走查询参数）');
 
+  // ---- 表头自动识别：仅整行可识别为列名才跳过；疑似错误数据首行不跳过 ----
+  const exH = await createExhibit('表头识别展品');
+  await call('POST', `/api/exhibits/${exH}/limits`, { year: 2031, limitLxh: 10000 }, 'c');
+  const hp1 = await submitPlan(exH, '表头目标计划', '2031-03-01', '2031-03-01', ['09:00-17:00'], 100);
+  await approvePlan(hp1); // 800
+  const csvBadStart =
+    'bad-start,bad-end,bad-lux\n' +
+    '2031-03-01 09:00,2031-03-01 10:00,100\n';
+  // 预览：首行不被当作表头跳过，按文件行号 1 列出全部原因，整批拒绝
+  r = await call('POST', '/api/measurement-batches/preview', { planId: hp1, csv: csvBadStart }, 'c');
+  assert(r.status === 400, `疑似错误数据首行预览拒绝（实际 ${r.status}）`);
+  const badStartRow = r.body.details.rows.find((x) => x.line === 1);
+  assert(badStartRow && badStartRow.row === 1, '首行按文件行号 1 列出');
+  assert(badStartRow.reasons.some((m) => /bad-start/.test(m)) &&
+    badStartRow.reasons.some((m) => /bad-end/.test(m)) &&
+    badStartRow.reasons.some((m) => /bad-lux/.test(m)),
+    `首行报出全部取值原因，实际=${JSON.stringify(badStartRow && badStartRow.reasons)}`);
+  // 导入：整批拒绝，不保存批次、不改变额度
+  r = await call('POST', '/api/measurement-batches', { planId: hp1, csv: csvBadStart }, 'c');
+  assert(r.status === 400 && /整批未保存/.test(r.body.error), '疑似错误数据首行导入整批拒绝');
+  assert(r.body.details.rows.some((x) => x.line === 1), '导入错误同样按文件行号列出首行');
+  r = await call('GET', `/api/measurement-batches?exhibitId=${exH}`, null, 'c');
+  assert(r.body.batches.length === 0, '首行错误不保存批次');
+  r = await call('GET', `/api/exhibits/${exH}`, null, 'c');
+  assert(r.body.years['2031'].used === 800, '首行错误不改变额度');
+  // 修正首行后导入 + 确认：实测不少计（2 行全部入账）
+  const csvFixed =
+    '2031-03-01 09:00,2031-03-01 10:00,100\n' +
+    '2031-03-01 10:00,2031-03-01 11:00,120\n';
+  r = await call('POST', '/api/measurement-batches', { planId: hp1, csv: csvFixed }, 'c');
+  assert(r.status === 201 && r.body.batch.rowCount === 2 && r.body.headerDetected === false,
+    '无表头文件修正后导入 2 行');
+  const batchH = r.body.batch.id;
+  r = await call('POST', `/api/measurement-batches/${batchH}/confirm`, {}, 'c');
+  assert(r.status === 200 && r.body.confirmResult.measurementIds.length === 2,
+    '确认后 2 条实测全部入账（不少计）');
+  r = await call('GET', `/api/exhibits/${exH}`, null, 'c');
+  assert(r.body.years['2031'].used === 820,
+    `确认后占用 820（估算800 − 被替代200 + 实测220），实际 ${r.body.years['2031'].used}`);
+  // 英文列名表头自动识别
+  r = await call('POST', '/api/measurement-batches/preview', {
+    planId: hp1, csv: 'start,end,lux,note\n2031-03-01 12:00,2031-03-01 13:00,100,ok\n',
+  }, 'c');
+  assert(r.status === 200 && r.body.preview.headerDetected === true &&
+    r.body.preview.rowCount === 1, '英文列名表头自动识别');
+  // 显式 hasHeader=true：首行即使是数据也按调用者指定跳过
+  r = await call('POST', '/api/measurement-batches/preview', {
+    planId: hp1,
+    csv: '2031-03-01 11:00,2031-03-01 12:00,100\n2031-03-01 12:00,2031-03-01 13:00,100\n',
+    hasHeader: true,
+  }, 'c');
+  assert(r.status === 200 && r.body.preview.headerDetected === true &&
+    r.body.preview.rowCount === 1, 'hasHeader=true 显式跳过首行');
+  // 显式 hasHeader=false：首行即使是列名也按数据行校验（整批拒绝）
+  r = await call('POST', '/api/measurement-batches/preview', {
+    planId: hp1, csv: '开始时间,结束时间,实际照度\n2031-03-01 12:00,2031-03-01 13:00,100\n',
+    hasHeader: false,
+  }, 'c');
+  assert(r.status === 400 && r.body.details.rows.some((x) => x.line === 1),
+    'hasHeader=false 时列名首行按数据行校验报错');
+
   // ---- 封存账册对照兼容：批次实测与单条实测同口径进入账册 ----
   const wallY3 = Number(dosing.tsToWall(Date.now()).ymd.slice(0, 4));
   const pastY = wallY3 - 2;

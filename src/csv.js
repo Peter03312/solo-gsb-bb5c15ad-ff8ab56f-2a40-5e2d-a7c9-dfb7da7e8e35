@@ -4,7 +4,9 @@
  * 实测 CSV 批次解析（规则 18）：
  * 每行 3~4 列 —— 开始日期时间,结束日期时间,实际照度[,备注]；
  * 日期时间为墙上时间，形如 `2026-03-01 09:00`（分隔符可为空格或 T，秒仅允许 :00）。
- * 首行若为表头（首列不是日期时间且第三列不是数字）自动跳过，可用 hasHeader 显式指定。
+ * 首行仅在整行都能识别为列名（见 HEADER_COLUMN_NAMES）时自动跳过，可用 hasHeader
+ * 显式指定；疑似数据但格式错误的首行（如 bad-start,bad-end,bad-lux）不跳过，
+ * 按数据行逐行校验并按原文件行号报出全部原因。
  */
 
 const { ValidationError, isValidYmd } = require('./validation');
@@ -104,6 +106,34 @@ function isFiniteNumberString(s) {
 }
 
 /**
+ * 已知列名表（按列位置，均已规范化：小写、去空白/下划线/连字符）。
+ * 首行每个字段规范化后须命中对应列的列名，整行才识别为表头。
+ */
+const HEADER_COLUMN_NAMES = [
+  ['开始日期时间', '开始时间', '开始日期', '开始', '起始日期时间', '起始时间',
+    'start', 'starttime', 'startdatetime', 'startdate', 'begin', 'begintime', 'from'],
+  ['结束日期时间', '结束时间', '结束日期', '结束', '终止日期时间', '终止时间',
+    'end', 'endtime', 'enddatetime', 'enddate', 'finish', 'finishtime', 'to'],
+  ['实际照度', '实测照度', '照度', 'lux', 'actuallux', 'actualilluminance', 'illuminance'],
+  ['备注', '说明', '注释', 'note', 'notes', 'remark', 'remarks', 'comment', 'memo'],
+];
+
+/** 列名规范化：去首尾空白、转小写、去掉空白/下划线/连字符（Start_Time -> starttime）。 */
+function normalizeHeaderName(s) {
+  return String(s == null ? '' : s).trim().toLowerCase().replace(/[\s_\-]+/g, '');
+}
+
+/**
+ * 首行是否可识别为列名表头：3~4 列，且每列都命中已知列名。
+ * 仅用于 hasHeader 缺省时的自动识别——疑似数据但格式错误的行
+ * （如 bad-start,bad-end,bad-lux）不命中，按数据行逐行校验并报错，不误跳过。
+ */
+function isHeaderRow(fields) {
+  if (!Array.isArray(fields) || fields.length < 3 || fields.length > 4) return false;
+  return fields.every((f, i) => HEADER_COLUMN_NAMES[i].includes(normalizeHeaderName(f)));
+}
+
+/**
  * 把 CSV 文本解析为实测批次行。
  * 返回 { rows, headerDetected }；每行：
  *   { row, line, startMs, endMs, lux, note, errors: [] }
@@ -121,13 +151,9 @@ function parseMeasurementCsvRows(text, { hasHeader } = {}) {
   if (hasHeader === true) {
     headerDetected = true;
     startIdx = 1;
-  } else if (
-    hasHeader === undefined &&
-    first.fields.length >= 3 &&
-    parseWallDateTime(first.fields[0]).error !== undefined &&
-    !isFiniteNumberString(first.fields[2])
-  ) {
-    // 首行首列不是日期时间且第三列不是数字 -> 视为表头自动跳过
+  } else if (hasHeader === undefined && isHeaderRow(first.fields)) {
+    // 首行整行可识别为列名 -> 视为表头自动跳过；
+    // 疑似数据但格式错误的首行不跳过，留给逐行校验按文件行号报错
     headerDetected = true;
     startIdx = 1;
   }
@@ -194,7 +220,9 @@ function parseMeasurementCsvRows(text, { hasHeader } = {}) {
 
 module.exports = {
   MAX_BATCH_ROWS,
+  HEADER_COLUMN_NAMES,
   parseCsvText,
   parseWallDateTime,
+  isHeaderRow,
   parseMeasurementCsvRows,
 };
