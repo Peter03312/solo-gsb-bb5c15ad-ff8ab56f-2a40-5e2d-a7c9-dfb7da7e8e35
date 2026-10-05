@@ -2756,6 +2756,79 @@ async function runFlow() {
     '2031-03-01 10:00,2031-03-01 11:00,100\n', 'text/csv', 'c');
   assert(r.status === 200 && r.body.preview.rowCount === 1, 'text/csv 原文预览（planId 走查询参数）');
 
+  // ---- 表头自动识别：仅识别列名；错误首行按数据行列出全部原因，整批拒绝且不保存 ----
+  const exHd = await createExhibit('批次表头展品');
+  await call('POST', `/api/exhibits/${exHd}/limits`, { year: 2031, limitLxh: 10000 }, 'c');
+  const hp1 = await submitPlan(exHd, '表头目标计划', '2031-03-01', '2031-03-01',
+    ['09:00-17:00'], 100);
+  await approvePlan(hp1);
+  const csvBadFirst =
+    'bad-start,bad-end,bad-lux\n' +
+    '2031-03-01 09:00,2031-03-01 12:00,120\n';
+  r = await call('POST', '/api/measurement-batches/preview', { planId: hp1, csv: csvBadFirst }, 'c');
+  assert(r.status === 400, `错误首行预览整批拒绝 400（实际 ${r.status}）`);
+  const bfRow = r.body.details.rows.find((x) => x.row === 1);
+  assert(bfRow && bfRow.line === 1 && bfRow.reasons.length === 3 &&
+    /bad-start/.test(bfRow.reasons[0]) && /bad-end/.test(bfRow.reasons[1]) &&
+    /bad-lux/.test(bfRow.reasons[2]),
+    `错误首行按文件第 1 行列出全部 3 条原因，实际=${JSON.stringify(bfRow)}`);
+  assert(r.body.details.rows.length === 1, '仅错误首行报错，后续有效行不报');
+  // 导入同口径：整批不保存、不改变额度
+  r = await call('POST', '/api/measurement-batches', { planId: hp1, csv: csvBadFirst }, 'c');
+  assert(r.status === 400 && r.body.details.rows[0].line === 1 &&
+    r.body.details.rows[0].reasons.length === 3, '错误首行导入整批拒绝（400，line=1 全部原因）');
+  r = await call('GET', `/api/measurement-batches?planId=${hp1}`, null, 'c');
+  assert(r.body.batches.length === 0, '错误首行整批不保存');
+  r = await call('GET', `/api/exhibits/${exHd}`, null, 'i');
+  assert(r.body.years['2031'].used === 800, '错误首行拒绝不改变额度（仅计划估算 800）');
+
+  // 显式 hasHeader=true：错误首行按调用者指定作为表头跳过，后续数据正常
+  r = await call('POST', '/api/measurement-batches/preview',
+    { planId: hp1, csv: csvBadFirst, hasHeader: true }, 'c');
+  assert(r.status === 200 && r.body.preview.headerDetected === true &&
+    r.body.preview.rowCount === 1 && r.body.preview.rows[0].line === 2,
+    'hasHeader=true 时首行强制按表头跳过（line 从 2 起）');
+  // 显式 hasHeader=false：规范表头文本也按数据行报错
+  r = await call('POST', '/api/measurement-batches/preview', {
+    planId: hp1, hasHeader: false,
+    csv: '开始时间,结束时间,实际照度,备注\n2031-03-01 09:00,2031-03-01 12:00,120\n',
+  }, 'c');
+  assert(r.status === 400 && r.body.details.rows[0].line === 1,
+    'hasHeader=false 时首行即便是列名也按数据行校验');
+  // 英文/带空格列名仍可自动识别
+  r = await call('POST', '/api/measurement-batches/preview', {
+    planId: hp1,
+    csv: ' Start Time ,End Time,Actual Lux,Note\n2031-03-01 09:00,2031-03-01 12:00,120\n',
+  }, 'c');
+  assert(r.status === 200 && r.body.preview.headerDetected === true &&
+    r.body.preview.rowCount === 1, '英文列名表头自动识别');
+  // 第四列列名不可识别（如 foo）不判为表头，按数据行报错
+  r = await call('POST', '/api/measurement-batches/preview', {
+    planId: hp1,
+    csv: '开始时间,结束时间,实际照度,foo\n2031-03-01 09:00,2031-03-01 12:00,120\n',
+  }, 'c');
+  assert(r.status === 400 && r.body.details.rows[0].line === 1, '第四列列名不可识别不判为表头');
+  // 合法有表头文件：导入+确认后实测逐行口径不变（2 行），重复确认幂等
+  r = await call('POST', '/api/measurement-batches', {
+    planId: hp1,
+    csv: '开始时间,结束时间,实际照度,备注\n' +
+         '2031-03-01 09:00,2031-03-01 12:00,120\n' +
+         '2031-03-01 13:00,2031-03-01 17:00,100\n',
+    sourceName: 'with-header.csv',
+  }, 'c');
+  assert(r.status === 201 && r.body.headerDetected === true &&
+    r.body.batch.rowCount === 2, '合法有表头文件导入 2 行');
+  const batchH = r.body.batch.id;
+  r = await call('POST', `/api/measurement-batches/${batchH}/confirm`, {}, 'c');
+  assert(r.status === 200 && r.body.confirmResult.measurementIds.length === 2,
+    '有表头批次确认生成 2 条实测（360+400=760，未漏计首数据行）');
+  r = await call('GET', `/api/exhibits/${exHd}`, null, 'i');
+  // 7h 实测 760 + 未覆盖的 1h（12:00~13:00）估算 100 = 860
+  assert(r.body.years['2031'].used === 860, `确认后占用 860，实际 ${r.body.years['2031'].used}`);
+  r = await call('POST', `/api/measurement-batches/${batchH}/confirm`, {}, 'c');
+  assert(r.status === 200 && r.body.duplicate === true &&
+    r.body.confirmResult.measurementIds.length === 2, '有表头批次重复确认幂等');
+
   // ---- 封存账册对照兼容：批次实测与单条实测同口径进入账册 ----
   const wallY3 = Number(dosing.tsToWall(Date.now()).ymd.slice(0, 4));
   const pastY = wallY3 - 2;

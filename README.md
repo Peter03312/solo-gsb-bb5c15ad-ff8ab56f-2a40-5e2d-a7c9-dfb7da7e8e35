@@ -132,7 +132,12 @@ Node.js（Express）+ PostgreSQL，本地账号区分两类角色：
       （展品详情仅附加 `incidents` / `incidentDoseYearly`，占用来源仅附加 `kind:'incident'`）。
 18. **实测 CSV 批次导入（conservator only）**：保管员可将某条**已批准（或待复核）计划**的分段实测
     CSV 导入为**待确认批次**；每行含墙上起止日期时间与实际照度（3~4 列：
-    `开始日期时间,结束日期时间,实际照度[,备注]`，首行表头自动识别）。
+    `开始日期时间,结束日期时间,实际照度[,备注]`，首行表头仅在能识别为列名时自动跳过）。
+    - **表头判断**：未指定 `hasHeader` 时，只有首行前三列分别识别为 开始/结束/照度 列名
+      （第四列若存在须为备注类列名；支持中英文常见列名，忽略大小写与首尾空白）才作为表头跳过，
+      响应 `headerDetected=true`；**疑似数据但格式错误的首行**（如
+      `bad-start,bad-end,bad-lux`）不再被误跳过，而是按文件第 1 行逐行列出全部校验原因。
+      `hasHeader=true` 强制跳过首行、`hasHeader=false` 强制按数据行处理，均以调用者为准。
     - **预览/导入同一校验口径**：逐行按自然年拆分剂量并汇总整批剂量，返回**整批预计占用**
       （实测替代估算口径：预计合计 = 当前占用 − 被替代估算 + 本批剂量）；**预览不写库、
       导入仅保存待确认批次，均不改变额度**。
@@ -1227,10 +1232,22 @@ curl -b cookies-custodian.txt -X POST http://localhost:3000/api/measurements/31/
 
 保管员把某条**已批准（或待复核）计划**的分段实测 CSV 导入为**待确认批次**，预览/确认后再入账。
 CSV 每行 3~4 列：`开始日期时间,结束日期时间,实际照度[,备注]`；日期时间为墙上时间
-`YYYY-MM-DD HH:MM`（分隔符可为空格或 `T`，秒仅允许 `:00`）；首行为表头时自动跳过
-（可用 `hasHeader=true/false` 显式指定）；单批最多 5000 行。
+`YYYY-MM-DD HH:MM`（分隔符可为空格或 `T`，秒仅允许 `:00`）；单批最多 5000 行。
+
+**表头判断**（请求字段 `hasHeader`，可选；JSON 在 body、text/csv 走查询参数）：
+
+- 缺省（自动）：首行**仅在能识别为列名**时跳过 —— 前三列须分别为 开始/结束/照度 列名
+  （认可如 `开始日期时间/开始时间/开始`、`结束日期时间/结束时间/结束`、
+  `实际照度/照度/lux`，忽略大小写、首尾空白及空格/下划线/连字符），第四列若存在须为
+  备注类列名（`备注/说明/note` 等）；此时响应 `headerDetected: true`。
+- **疑似数据但格式错误的首行**（如 `bad-start,bad-end,bad-lux`）识别不出列名，**不会被跳过**：
+  按文件第 1 行参与逐行校验，预览与导入均整批拒绝（400，`details.rows` 以原文件行号
+  `line` 列出该行**全部**原因），不保存批次、不改变额度。
+- `hasHeader=true`：无论首行内容如何都强制跳过；`hasHeader=false`：即使首行长得像列名
+  也按数据行校验（首行数据行号为 1）。
+
 提交方式二选一：JSON `{"planId":7,"csv":"...","sourceName":"march.csv"}`，
-或 `Content-Type: text/csv` 直接提交 CSV 原文（`planId` 走查询参数）。
+或 `Content-Type: text/csv` 直接提交 CSV 原文（`planId`、`hasHeader` 走查询参数）。
 
 | 方法 & 路径 | 角色 | 说明 |
 | --- | --- | --- |
@@ -1261,6 +1278,20 @@ curl -b cookies-custodian.txt -X POST http://localhost:3000/api/measurement-batc
 curl -b cookies-custodian.txt -X POST \
   'http://localhost:3000/api/measurement-batches/preview?planId=7' \
   -H 'Content-Type: text/csv' --data-binary @march.csv
+
+# 1b) 表头控制：自动识别（缺省）/ 强制有表头 / 强制无表头
+#     text/csv 时 hasHeader 走查询参数；JSON 时放在 body
+curl -b cookies-custodian.txt -X POST \
+  'http://localhost:3000/api/measurement-batches/preview?planId=7&hasHeader=true' \
+  -H 'Content-Type: text/csv' --data-binary @march.csv
+curl -b cookies-custodian.txt -X POST http://localhost:3000/api/measurement-batches/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"planId":7,"hasHeader":false,"csv":"开始时间,结束时间,实际照度\n2031-03-01 09:00,2031-03-01 12:00,120\n"}'
+# 错误首行（bad-start,bad-end,bad-lux）缺省时不再被当表头：400 且 details.rows
+# 以原文件行号 line=1 列出该行全部原因，整批拒绝、不保存
+curl -b cookies-custodian.txt -X POST http://localhost:3000/api/measurement-batches/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"planId":7,"csv":"bad-start,bad-end,bad-lux\n2031-03-01 09:00,2031-03-01 12:00,120\n"}'
 
 # 2) 导入为待确认批次（不改变额度；有错误整批不保存）
 curl -b cookies-custodian.txt -X POST 'http://localhost:3000/api/measurement-batches?planId=7' \
@@ -1311,6 +1342,26 @@ curl -b cookies-custodian.txt -X POST http://localhost:3000/api/measurement-batc
       { "row": 6, "line": 6, "kinds": ["overlap"],
         "reasons": ["与第 5 行（2031-03-01 10:00 ~ 2031-03-01 11:00）时段相交"],
         "conflicts": { "overlappingRows": [5] } }
+    ]
+  }
+}
+```
+
+未指定 `hasHeader` 且首行**疑似数据但格式错误**（识别不出列名）时，首行不会被当表头跳过，
+而是作为文件第 1 行列出**全部**原因，预览与导入同口径整批拒绝（400，不保存批次、不改变额度）：
+
+```json
+{
+  "error": "实测 CSV 校验失败，整批未保存：第 1 行：开始日期时间无效：bad-start（应为 YYYY-MM-DD HH:MM）；结束日期时间无效：bad-end（应为 YYYY-MM-DD HH:MM）；实际照度必须是数字：bad-lux",
+  "details": {
+    "rows": [
+      { "row": 1, "line": 1, "kinds": ["value"],
+        "reasons": [
+          "开始日期时间无效：bad-start（应为 YYYY-MM-DD HH:MM）",
+          "结束日期时间无效：bad-end（应为 YYYY-MM-DD HH:MM）",
+          "实际照度必须是数字：bad-lux"
+        ],
+        "conflicts": {} }
     ]
   }
 }

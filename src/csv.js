@@ -4,7 +4,8 @@
  * 实测 CSV 批次解析（规则 18）：
  * 每行 3~4 列 —— 开始日期时间,结束日期时间,实际照度[,备注]；
  * 日期时间为墙上时间，形如 `2026-03-01 09:00`（分隔符可为空格或 T，秒仅允许 :00）。
- * 首行若为表头（首列不是日期时间且第三列不是数字）自动跳过，可用 hasHeader 显式指定。
+ * 未指定 hasHeader 时，首行仅在能识别为列名时才自动跳过；疑似数据但格式错误的首行
+ * （如 bad-start,bad-end,bad-lux）按数据行参与逐行校验；可用 hasHeader 显式指定。
  */
 
 const { ValidationError, isValidYmd } = require('./validation');
@@ -104,11 +105,61 @@ function isFiniteNumberString(s) {
 }
 
 /**
+ * 识别的表头列名（去空白、大小写不敏感精确匹配）。
+ * 前三列须分别为 开始 / 结束 / 照度 列名；第四列若存在须为备注类列名。
+ */
+const HEADER_ALIASES = {
+  start: new Set([
+    '开始日期时间', '开始时间', '开始', '起始时间', '起始日期时间', '起始',
+    'start', 'starttime', 'startdatetime', 'begin', 'from',
+  ]),
+  end: new Set([
+    '结束日期时间', '结束时间', '结束', '截止时间', '终止时间', '终止日期时间', '截止',
+    'end', 'endtime', 'enddatetime', 'to',
+  ]),
+  lux: new Set([
+    '实际照度', '照度', '实际照度(lx)', '实际照度（lx）', '照度(lx)', '照度（lx）',
+    'lux', 'actuallux', 'illuminance',
+  ]),
+  note: new Set([
+    '备注', '说明', '注释', '注', 'note', 'notes', 'remark', 'remarks', 'comment',
+  ]),
+};
+
+/** 表头匹配键归一化：去首尾空白、转小写、去掉空格/下划线/连字符、全角括号转半角。 */
+function normalizeHeaderName(raw) {
+  return String(raw == null ? '' : raw)
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_-]/g, '')
+    .replace(/（/g, '(')
+    .replace(/）/g, ')');
+}
+
+/**
+ * 判断首行是否为可识别的列名表头。
+ * 要求 3~4 列，前三列分别匹配 开始/结束/照度 列名（缺一不可）；
+ * 第四列若存在须为备注类列名，避免把错误数据行误判为表头。
+ */
+function isRecognizedHeaderRow(fields) {
+  if (!Array.isArray(fields) || fields.length < 3 || fields.length > 4) return false;
+  const f = fields.map(normalizeHeaderName);
+  if (f.some((x) => x === '')) return false;
+  if (!HEADER_ALIASES.start.has(f[0])) return false;
+  if (!HEADER_ALIASES.end.has(f[1])) return false;
+  if (!HEADER_ALIASES.lux.has(f[2])) return false;
+  if (f.length === 4 && !HEADER_ALIASES.note.has(f[3])) return false;
+  return true;
+}
+
+/**
  * 把 CSV 文本解析为实测批次行。
  * 返回 { rows, headerDetected }；每行：
  *   { row, line, startMs, endMs, lux, note, errors: [] }
  * row 为数据行号（1 起，不含表头），line 为文件行号；
  * errors 为字符串数组（解析/取值类错误），时段有效的行 startMs/endMs 为毫秒。
+ * hasHeader=true/false 时按调用者指定处理；缺省时首行仅在能识别为列名时自动跳过，
+ * 疑似数据但格式错误的首行作为数据行（line=1）列出全部校验原因。
  * 整批性错误（空 CSV、行数超限）直接抛 ValidationError。
  */
 function parseMeasurementCsvRows(text, { hasHeader } = {}) {
@@ -121,13 +172,9 @@ function parseMeasurementCsvRows(text, { hasHeader } = {}) {
   if (hasHeader === true) {
     headerDetected = true;
     startIdx = 1;
-  } else if (
-    hasHeader === undefined &&
-    first.fields.length >= 3 &&
-    parseWallDateTime(first.fields[0]).error !== undefined &&
-    !isFiniteNumberString(first.fields[2])
-  ) {
-    // 首行首列不是日期时间且第三列不是数字 -> 视为表头自动跳过
+  } else if (hasHeader === undefined && isRecognizedHeaderRow(first.fields)) {
+    // 首行能识别为列名（开始/结束/照度[/备注]）才自动跳过；
+    // 疑似数据但格式错误的首行（如 bad-start,bad-end,bad-lux）保留为数据行逐行报错。
     headerDetected = true;
     startIdx = 1;
   }
@@ -197,4 +244,5 @@ module.exports = {
   parseCsvText,
   parseWallDateTime,
   parseMeasurementCsvRows,
+  isRecognizedHeaderRow,
 };
